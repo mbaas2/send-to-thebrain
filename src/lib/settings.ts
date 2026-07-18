@@ -21,6 +21,8 @@ export interface Settings {
 	// port-discovery probe to find TheBrain after the desktop app rotates
 	// to a new port across sessions.
 	recentPorts: number[];
+	defaultBrainId: string;
+	thoughtTargetIndex: number;
 }
 
 export const AUTO_PROCEED_MS = 3000;
@@ -41,6 +43,8 @@ const DEFAULTS: Settings = {
 	trimQueryParamsExceptions: [...DEFAULT_TRIM_EXCEPTIONS],
 	autoProceed: false,
 	recentPorts: [],
+	defaultBrainId: "",
+	thoughtTargetIndex: 0,
 };
 
 const KEYS: (keyof Settings)[] = [
@@ -52,6 +56,8 @@ const KEYS: (keyof Settings)[] = [
 	"trimQueryParamsExceptions",
 	"autoProceed",
 	"recentPorts",
+	"defaultBrainId",
+	"thoughtTargetIndex",
 ];
 
 export async function getSettings(): Promise<Settings> {
@@ -91,6 +97,16 @@ export async function getSettings(): Promise<Settings> {
 					)
 					.slice(0, RECENT_PORTS_LIMIT)
 			: [...DEFAULTS.recentPorts],
+		defaultBrainId:
+			typeof stored.defaultBrainId === "string"
+				? stored.defaultBrainId
+				: DEFAULTS.defaultBrainId,
+		thoughtTargetIndex:
+			typeof stored.thoughtTargetIndex === "number" &&
+			Number.isInteger(stored.thoughtTargetIndex) &&
+			stored.thoughtTargetIndex >= 0
+				? stored.thoughtTargetIndex
+				: DEFAULTS.thoughtTargetIndex,
 	};
 }
 
