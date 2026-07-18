@@ -8,7 +8,7 @@
 	"scripts": {
 		"dev": "vite",
 		"icons": "node scripts/generate-icons.mjs",
-		"build": "tsc --noEmit && vite build",
+		"build": "tsc --noEmit && vite build && node scripts/post-build.js",
 		"test": "vitest run",
 		"test:watch": "vitest"
 	},
