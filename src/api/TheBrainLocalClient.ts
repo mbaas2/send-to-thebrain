@@ -119,6 +119,10 @@ export class TheBrainLocalClient {
 		return this.request<Thought>("GET", `/api/thoughts/${brainId}/${thoughtId}`);
 	}
 
+	getPinnedThoughts(brainId: string): Promise<Thought[]> {
+		return this.request<Thought[]>("GET", `/api/thoughts/${brainId}/pins`);
+	}
+
 	findAttachmentsByLocation(
 		brainId: string,
 		location: string,
@@ -139,6 +143,7 @@ export class TheBrainLocalClient {
 		parentThoughtId: string,
 		name: string,
 		label: string,
+		typeId?: string | null,
 	): Promise<CreateThoughtResponse> {
 		const body: CreateThoughtRequest = {
 			name,
@@ -146,7 +151,7 @@ export class TheBrainLocalClient {
 			sourceThoughtId: parentThoughtId,
 			relation: LinkRelation.Child,
 			kind: ThoughtKind.Normal,
-			typeId: null,
+			typeId: typeId || null,
 			acType: AcType.Public,
 		};
 		return this.request<CreateThoughtResponse>(
@@ -154,6 +159,41 @@ export class TheBrainLocalClient {
 			`/api/thoughts/${brainId}`,
 			body,
 		);
+	}
+
+	getThoughtTypes(brainId: string): Promise<Thought[]> {
+		return this.request<Thought[]>("GET", `/api/thoughts/${brainId}/types`);
+	}
+
+	getThoughtTags(brainId: string): Promise<Thought[]> {
+		return this.request<Thought[]>("GET", `/api/thoughts/${brainId}/tags`);
+	}
+
+	createThought(
+		brainId: string,
+		request: CreateThoughtRequest,
+	): Promise<CreateThoughtResponse> {
+		return this.request<CreateThoughtResponse>(
+			"POST",
+			`/api/thoughts/${brainId}`,
+			request,
+		);
+	}
+
+	createLink(
+		brainId: string,
+		thoughtIdA: string,
+		thoughtIdB: string,
+		relation: LinkRelation,
+		name?: string,
+	): Promise<void> {
+		const body = {
+			thoughtIdA,
+			thoughtIdB,
+			relation,
+			name: name || null,
+		};
+		return this.request<void>("POST", `/api/links/${brainId}`, body);
 	}
 
 	attachUrl(
