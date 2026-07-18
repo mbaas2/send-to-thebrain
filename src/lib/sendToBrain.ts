@@ -9,7 +9,7 @@ import {
 	ApiError,
 	TheBrainError,
 } from "../api/errors";
-import type { AppState } from "../api/types";
+import { LinkRelation, ThoughtKind } from "../api/types";
 import type { SendMode } from "./settings";
 import { splitTitle } from "./titleSplit";
 
@@ -19,6 +19,12 @@ export interface SendInput {
 	tabUrl: string;
 	mode: SendMode;
 	activateAfterSend: boolean;
+	targetBrainId?: string;
+	targetParentThoughtId?: string;
+	typeId?: string | null;
+	newTypeName?: string | null;
+	tagIds?: string[];
+	newTagNames?: string[];
 }
 
 export type SendOutcome =
@@ -43,21 +49,52 @@ export type SendOutcome =
 	  };
 
 export async function sendToBrain(input: SendInput): Promise<SendOutcome> {
-	const { client, tabTitle, tabUrl, mode, activateAfterSend } = input;
+	const {
+		client,
+		tabTitle,
+		tabUrl,
+		mode,
+		activateAfterSend,
+		targetBrainId,
+		targetParentThoughtId,
+		typeId,
+		newTypeName,
+		tagIds,
+		newTagNames,
+	} = input;
 
-	const state = await client.getAppState();
-	if(!state.currentBrainId || !state.activeThoughtId) {
-		throw new NoBrainOpenError();
+	let brainId = targetBrainId;
+	let parentThoughtId = targetParentThoughtId;
+	let parentThoughtName = "active thought";
+
+	if (!brainId || !parentThoughtId) {
+		const state = await client.getAppState();
+		if(!state.currentBrainId || !state.activeThoughtId) {
+			throw new NoBrainOpenError();
+		}
+		brainId = brainId || state.currentBrainId;
+		parentThoughtId = parentThoughtId || state.activeThoughtId;
+		parentThoughtName = state.activeThoughtName ?? "active thought";
+	} else if (!parentThoughtId) {
+		// If we only have brainId, we'll need to fetch the home thought to use as parent
+		const brains = await client.getBrains();
+		const targetBrain = brains.find((b) => b.id === brainId);
+		if (targetBrain) {
+			parentThoughtId = targetBrain.homeThoughtId;
+			parentThoughtName = "Home";
+		} else {
+			throw new Error("Target brain not found.");
+		}
 	}
 
-	const existing = await findExistingThoughtWithUrl(client, state, tabUrl);
+	const existing = await findExistingThoughtWithUrl(client, brainId, tabUrl);
 	if(existing) {
 		if(activateAfterSend) {
-			await client.activateThought(state.currentBrainId, existing.thoughtId);
+			await client.activateThought(brainId, existing.thoughtId);
 		}
 		return {
 			kind: "alreadyExists",
-			brainId: state.currentBrainId,
+			brainId: brainId,
 			thoughtId: existing.thoughtId,
 			thoughtName: existing.thoughtName,
 		};
@@ -68,25 +105,80 @@ export async function sendToBrain(input: SendInput): Promise<SendOutcome> {
 	const attachmentName = tabTitle.trim().length > 0 ? tabTitle.trim() : tabUrl;
 
 	try {
+		// 1. Resolve / create Type if needed
+		let effectiveTypeId = typeId || null;
+		if (!effectiveTypeId && newTypeName && newTypeName.trim().length > 0) {
+			const existingTypes = await client.getThoughtTypes(brainId);
+			const found = existingTypes.find(
+				(t) => t.name.toLowerCase() === newTypeName.trim().toLowerCase(),
+			);
+			if (found) {
+				effectiveTypeId = found.id;
+			} else {
+				const createdType = await client.createThought(brainId, {
+					name: newTypeName.trim(),
+					kind: ThoughtKind.Type,
+					acType: 0,
+				});
+				effectiveTypeId = createdType.id;
+			}
+		}
+
+		// 2. Resolve / create Tags if needed
+		const finalTagIds: string[] = [...(tagIds || [])];
+		if (newTagNames && newTagNames.length > 0) {
+			const existingTags = await client.getThoughtTags(brainId);
+			for (const tagOfNew of newTagNames) {
+				const trimmed = tagOfNew.trim();
+				if (trimmed.length === 0) continue;
+				const found = existingTags.find(
+					(t) => t.name.toLowerCase() === trimmed.toLowerCase(),
+				);
+				if (found) {
+					if (!finalTagIds.includes(found.id)) {
+						finalTagIds.push(found.id);
+					}
+				} else {
+					const createdTag = await client.createThought(brainId, {
+						name: trimmed,
+						kind: ThoughtKind.Tag,
+						acType: 0,
+					});
+					finalTagIds.push(createdTag.id);
+				}
+			}
+		}
+
 		if(mode === "createChild") {
 			const created = await client.createChildThought(
-				state.currentBrainId,
-				state.activeThoughtId,
+				brainId,
+				parentThoughtId,
 				effectiveName,
 				label,
+				effectiveTypeId,
 			);
 			await client.attachUrl(
-				state.currentBrainId,
+				brainId,
 				created.id,
 				tabUrl,
 				attachmentName,
 			);
+
+			// Link the tags
+			for (const tagId of finalTagIds) {
+				try {
+					await client.createLink(brainId, tagId, created.id, LinkRelation.Child);
+				} catch (err) {
+					console.warn(`[Send to TheBrain] failed to link tag ${tagId}:`, err);
+				}
+			}
+
 			if(activateAfterSend) {
-				await client.activateThought(state.currentBrainId, created.id);
+				await client.activateThought(brainId, created.id);
 			}
 			return {
 				kind: "created",
-				brainId: state.currentBrainId,
+				brainId: brainId,
 				thoughtId: created.id,
 				thoughtName: effectiveName,
 				label,
@@ -95,16 +187,25 @@ export async function sendToBrain(input: SendInput): Promise<SendOutcome> {
 
 		// attachToActive
 		await client.attachUrl(
-			state.currentBrainId,
-			state.activeThoughtId,
+			brainId,
+			parentThoughtId,
 			tabUrl,
 			attachmentName,
 		);
+		// Also link tags in attachToActive just in case the user specified them
+		for (const tagId of finalTagIds) {
+			try {
+				await client.createLink(brainId, tagId, parentThoughtId, LinkRelation.Child);
+			} catch (err) {
+				console.warn(`[Send to TheBrain] failed to link tag ${tagId}:`, err);
+			}
+		}
+
 		return {
 			kind: "attached",
-			brainId: state.currentBrainId,
-			thoughtId: state.activeThoughtId,
-			thoughtName: state.activeThoughtName ?? "active thought",
+			brainId: brainId,
+			thoughtId: parentThoughtId,
+			thoughtName: parentThoughtName,
 		};
 	} catch(error) {
 		// Auth and user-mismatch have already been filtered out in the client.
@@ -123,15 +224,15 @@ interface ExistingHit {
 
 async function findExistingThoughtWithUrl(
 	client: TheBrainLocalClient,
-	state: AppState,
+	brainId: string,
 	url: string,
 ): Promise<ExistingHit | null> {
-	if(!state.currentBrainId) {
+	if(!brainId) {
 		return null;
 	}
 	let attachments;
 	try {
-		attachments = await client.findAttachmentsByLocation(state.currentBrainId, url);
+		attachments = await client.findAttachmentsByLocation(brainId, url);
 	} catch(error) {
 		if(error instanceof ApiError && error.status === 404) {
 			console.warn(
@@ -155,7 +256,7 @@ async function findExistingThoughtWithUrl(
 	}
 	let thoughtName = hit.name ?? "existing thought";
 	try {
-		const thought = await client.getThought(state.currentBrainId, hit.sourceId);
+		const thought = await client.getThought(brainId, hit.sourceId);
 		thoughtName = thought.name;
 	} catch {
 		// Fall back to the attachment name if the thought fetch fails.
