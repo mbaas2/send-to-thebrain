@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, type KeyboardEvent } from "react";
 import { TheBrainLocalClient } from "../api/TheBrainLocalClient";
 import {
 	TheBrainError,
@@ -21,6 +21,7 @@ import {
 } from "../lib/portDiscovery";
 import { sendToBrain, type SendOutcome } from "../lib/sendToBrain";
 import { stripUnreadCountPrefix } from "../lib/titleSplit";
+import type { Brain, Thought, ThoughtReference } from "../api/types";
 import {
 	AUTO_PROCEED_MS,
 	getSettings,
@@ -35,6 +36,10 @@ interface ActiveThought {
 	id: string;
 	name: string;
 	brainName: string | null;
+}
+
+interface ThoughtTarget extends ThoughtReference {
+	source: "active" | "pin";
 }
 
 const AUTO_CLOSE_MS = 3000;
@@ -56,15 +61,100 @@ export function PopupApp() {
 	const [autoProceedActive, setAutoProceedActive] = useState(false);
 	const [successAutoCloseActive, setSuccessAutoCloseActive] = useState(true);
 
-	// Verify that the desktop app is reachable, the API key works, and a brain
-	// is open — so the user sees a problem immediately, not only after clicking
-	// Send. Called on popup open and again when the user hits Try again.
-	//
-	// If the saved endpoint is unreachable (typical: TheBrain restarted and now
-	// listens on a different port), we transparently probe a small set of
-	// candidate ports (last-used + MRU history + a few defaults) and rotate
-	// onto the first one that answers. The new endpoint is persisted so the
-	// next launch starts on the right port.
+	const [brains, setBrains] = useState<Brain[] | null>(null);
+	const [selectedBrainId, setSelectedBrainId] = useState<string>("");
+	const [types, setTypes] = useState<Thought[]>([]);
+	const [tags, setTags] = useState<Thought[]>([]);
+	const [selectedTypeId, setSelectedTypeId] = useState<string | null>(null);
+	const [newTypeName, setNewTypeName] = useState<string>("");
+	const [selectedTagIds, setSelectedTagIds] = useState<string[]>([]);
+	const [newTagNames, setNewTagNames] = useState<string[]>([]);
+	const [isLoadingMetadata, setIsLoadingMetadata] = useState<boolean>(false);
+
+	const [thoughtTargets, setThoughtTargets] = useState<ThoughtTarget[]>([]);
+	const [selectedTargetIndex, setSelectedTargetIndex] = useState<number>(0);
+
+	const loadBrainMetadata = useCallback(async (
+		client: TheBrainLocalClient,
+		brainId: string,
+		appState: any,
+		allBrains: Brain[]
+	): Promise<ThoughtTarget[]> => {
+		setIsLoadingMetadata(true);
+		let targetList: ThoughtTarget[] = [];
+		try {
+			let parentId = "";
+			let parentName = "";
+			
+			const matchingTab = appState?.tabs?.find((t: any) => t.brainId === brainId);
+			if (matchingTab && matchingTab.activeThoughtId) {
+				parentId = matchingTab.activeThoughtId;
+				parentName = matchingTab.activeThoughtName ?? "active thought";
+			} else {
+				const brainInfo = allBrains.find((b) => b.id === brainId);
+				if (brainInfo) {
+					parentId = brainInfo.homeThoughtId;
+					parentName = "Home";
+					try {
+						const homeThought = await client.getThought(brainId, brainInfo.homeThoughtId);
+						parentName = homeThought.name;
+					} catch {
+						// ignore
+					}
+				}
+			}
+
+			const brainInfo = allBrains.find((b) => b.id === brainId);
+			setActiveThought({
+				id: parentId,
+				name: parentName,
+				brainName: brainInfo ? brainInfo.name : null,
+			});
+
+			if (parentId) {
+				targetList.push({
+					id: parentId,
+					name: parentName,
+					source: "active",
+				});
+			}
+
+			try {
+				const pins = await client.getPinnedThoughts(brainId);
+				const pinTargets = pins
+					.filter((pin) => pin.id !== parentId)
+					.map((pin): ThoughtTarget => ({
+						id: pin.id,
+						name: pin.name || "unnamed thought",
+						source: "pin",
+					}));
+				targetList = [...targetList, ...pinTargets];
+			} catch (err) {
+				console.warn("Failed to fetch pinned thoughts:", err);
+			}
+
+			setThoughtTargets(targetList);
+
+			const [fetchedTypes, fetchedTags] = await Promise.all([
+				client.getThoughtTypes(brainId),
+				client.getThoughtTags(brainId),
+			]);
+
+			setTypes(fetchedTypes);
+			setTags(fetchedTags);
+
+			setSelectedTypeId(null);
+			setNewTypeName("");
+			setSelectedTagIds([]);
+			setNewTagNames([]);
+		} catch (err) {
+			console.error("Failed to load brain metadata:", err);
+		} finally {
+			setIsLoadingMetadata(false);
+		}
+		return targetList;
+	}, []);
+
 	const probeConnection = useCallback(async (s: Settings) => {
 		setView({ kind: "probing" });
 		let effective = s;
@@ -88,17 +178,27 @@ export function PopupApp() {
 			if(!state.currentBrainId || !state.activeThoughtId) {
 				throw new NoBrainOpenError();
 			}
-			// Record the working port so future launches start on a known-good
-			// candidate even before the saved endpoint gets refreshed elsewhere.
 			await rememberWorkingPort(effective, client.getBaseUrl());
-			setActiveThought({
-				id: state.activeThoughtId,
-				name: state.activeThoughtName ?? "active thought",
-				brainName: state.currentBrainName,
-			});
+			
+			const allBrains = await client.getBrains();
+			setBrains(allBrains);
+
+			let targetBrainId = effective.defaultBrainId;
+			if (!targetBrainId || !allBrains.some((b) => b.id === targetBrainId)) {
+				targetBrainId = state.currentBrainId;
+			}
+			setSelectedBrainId(targetBrainId);
+
+			const targets = await loadBrainMetadata(client, targetBrainId, state, allBrains);
+			setSelectedTargetIndex(
+				clampThoughtTargetIndex(effective.thoughtTargetIndex, targets),
+			);
+
 			setView({ kind: "ready" });
 		} catch(error) {
 			setActiveThought(null);
+			setThoughtTargets([]);
+			setSelectedTargetIndex(0);
 			const message =
 				error instanceof NotRunningError
 					? "TheBrain isn't reachable on any known port. Open the desktop app, copy the Local API URL into Settings, then try again."
@@ -109,7 +209,7 @@ export function PopupApp() {
 							: "Could not reach TheBrain.";
 			setView({ kind: "error", message, recoverable: true });
 		}
-	}, []);
+	}, [loadBrainMetadata]);
 
 	useEffect(() => {
 		let cancelled = false;
@@ -139,8 +239,40 @@ export function PopupApp() {
 		};
 	}, [probeConnection]);
 
+	const handleBrainChange = useCallback(async (brainId: string) => {
+		if (!settings || !brains) return;
+		setSelectedBrainId(brainId);
+		await updateSettings({ defaultBrainId: brainId, thoughtTargetIndex: 0 });
+		setSettings((prev) =>
+			prev
+				? { ...prev, defaultBrainId: brainId, thoughtTargetIndex: 0 }
+				: prev,
+		);
+		setSelectedTargetIndex(0);
+
+		const client = new TheBrainLocalClient({
+			apiKey: settings.apiKey,
+			endpoint: settings.endpoint,
+		});
+		try {
+			const state = await client.getAppState();
+			await loadBrainMetadata(client, brainId, state, brains);
+		} catch (err) {
+			console.error("Failed to update brain metadata on change:", err);
+		}
+	}, [settings, brains, loadBrainMetadata]);
+
+	const handleTargetChange = useCallback(async (thoughtTargetIndex: number) => {
+		await updateSettings({ thoughtTargetIndex });
+		setSettings((prev) => (prev ? { ...prev, thoughtTargetIndex } : prev));
+		setSelectedTargetIndex(thoughtTargetIndex);
+	}, []);
+
 	const handleSend = useCallback(async () => {
-		if(!tab || !settings) return;
+		if(!tab || !settings || !activeThought || !selectedBrainId) return;
+		const targetThought = thoughtTargets[selectedTargetIndex];
+		const parentId = targetThought ? targetThought.id : activeThought.id;
+		
 		setView({ kind: "sending" });
 		const client = new TheBrainLocalClient({
 			apiKey: settings.apiKey,
@@ -157,6 +289,12 @@ export function PopupApp() {
 				tabUrl: effectiveUrl,
 				mode: settings.mode,
 				activateAfterSend: settings.activateAfterSend,
+				targetBrainId: selectedBrainId,
+				targetParentThoughtId: parentId,
+				typeId: selectedTypeId,
+				newTypeName: newTypeName,
+				tagIds: selectedTagIds,
+				newTagNames: newTagNames,
 			});
 			setView({ kind: "success", outcome, client });
 		} catch(error) {
@@ -168,7 +306,18 @@ export function PopupApp() {
 						: "Something went wrong.";
 			setView({ kind: "error", message, recoverable: true });
 		}
-	}, [tab, settings]);
+	}, [
+		tab,
+		settings,
+		activeThought,
+		selectedBrainId,
+		thoughtTargets,
+		selectedTargetIndex,
+		selectedTypeId,
+		newTypeName,
+		selectedTagIds,
+		newTagNames,
+	]);
 
 	// Arm the countdown when we first reach the ready view, if the user
 	// opted in. Cancelling (user interaction) sets autoProceedActive to
@@ -272,7 +421,7 @@ export function PopupApp() {
 	return (
 		<div className="flex flex-col gap-3 p-4">
 			<Header />
-			{view.kind === "ready" && settings && tab && activeThought && (
+			{view.kind === "ready" && settings && tab && activeThought && brains && (
 				<ReadyCard
 					tab={tab}
 					activeThought={activeThought}
@@ -283,6 +432,25 @@ export function PopupApp() {
 					onTrimChange={handleTrimChange}
 					onSend={handleSend}
 					autoProceedActive={autoProceedActive}
+					brains={brains}
+					selectedBrainId={selectedBrainId}
+					onBrainChange={handleBrainChange}
+					types={types}
+					tags={tags}
+					selectedTypeId={selectedTypeId}
+					onTypeChange={(id, newName) => {
+						setSelectedTypeId(id);
+						setNewTypeName(newName);
+					}}
+					newTypeName={newTypeName}
+					selectedTagIds={selectedTagIds}
+					onSelectedTagIdsChange={setSelectedTagIds}
+					newTagNames={newTagNames}
+					onNewTagNamesChange={setNewTagNames}
+					isLoadingMetadata={isLoadingMetadata}
+					thoughtTargets={thoughtTargets}
+					selectedTargetIndex={selectedTargetIndex}
+					onTargetChange={handleTargetChange}
 				/>
 			)}
 			{view.kind === "sending" && tab && <SendingCard tab={tab} />}
@@ -358,6 +526,13 @@ async function rememberWorkingPort(s: Settings, baseUrl: string): Promise<void> 
 	}
 }
 
+function clampThoughtTargetIndex(index: number, list: unknown[]): number {
+	if (list.length === 0) return 0;
+	if (index < 0) return 0;
+	if (index >= list.length) return 0;
+	return index;
+}
+
 function Header() {
 	return (
 		<div className="flex items-center gap-2">
@@ -393,6 +568,294 @@ function Header() {
 	);
 }
 
+function TagsSelector({
+	existingTags,
+	selectedTagIds,
+	onSelectedTagIdsChange,
+	newTagNames,
+	onNewTagNamesChange,
+}: {
+	existingTags: Thought[];
+	selectedTagIds: string[];
+	onSelectedTagIdsChange: (ids: string[]) => void;
+	newTagNames: string[];
+	onNewTagNamesChange: (names: string[]) => void;
+}) {
+	const [input, setInput] = useState("");
+	const [isFocused, setIsFocused] = useState(false);
+
+	const selectedTags = existingTags.filter((t) => selectedTagIds.includes(t.id));
+
+	const suggestions = existingTags
+		.filter(
+			(t) =>
+				!selectedTagIds.includes(t.id) &&
+				(!input.trim() || t.name.toLowerCase().includes(input.toLowerCase().trim())),
+		)
+		.sort((a, b) => a.name.localeCompare(b.name));
+
+	const showCreateOption =
+		input.trim() &&
+		!existingTags.some((t) => t.name.toLowerCase() === input.trim().toLowerCase()) &&
+		!newTagNames.some((n) => n.toLowerCase() === input.trim().toLowerCase());
+
+	const handleAddTagId = (id: string) => {
+		onSelectedTagIdsChange([...selectedTagIds, id]);
+		setInput("");
+	};
+
+	const handleAddNewTagName = (name: string) => {
+		onNewTagNamesChange([...newTagNames, name]);
+		setInput("");
+	};
+
+	const handleRemoveTagId = (id: string) => {
+		onSelectedTagIdsChange(selectedTagIds.filter((x) => x !== id));
+	};
+
+	const handleRemoveNewTagName = (name: string) => {
+		onNewTagNamesChange(newTagNames.filter((x) => x !== name));
+	};
+
+	const handleKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
+		if (e.key === "Enter" && input.trim()) {
+			e.preventDefault();
+			const exactMatch = suggestions.find(
+				(t) => t.name.toLowerCase() === input.trim().toLowerCase(),
+			);
+			if (exactMatch) {
+				handleAddTagId(exactMatch.id);
+			} else if (showCreateOption) {
+				handleAddNewTagName(input.trim());
+			} else if (suggestions.length > 0) {
+				handleAddTagId(suggestions[0].id);
+			}
+		}
+	};
+
+	return (
+		<div className="relative flex flex-col gap-1.5">
+			<span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">Tags</span>
+			<div className="flex flex-wrap gap-1 rounded-md border border-input bg-background p-1.5 min-h-[36px] focus-within:border-brand focus-within:ring-1 focus-within:ring-brand shadow-sm">
+				{selectedTags.map((tag) => (
+					<span
+						key={tag.id}
+						className="inline-flex items-center gap-1 rounded bg-secondary px-2 py-0.5 text-xs text-secondary-foreground"
+					>
+						{tag.name}
+						<button
+							type="button"
+							className="rounded hover:bg-muted p-0.5"
+							onClick={() => handleRemoveTagId(tag.id)}
+						>
+							<svg className="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+								<path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+							</svg>
+						</button>
+					</span>
+				))}
+				{newTagNames.map((name) => (
+					<span
+						key={name}
+						className="inline-flex items-center gap-1 rounded bg-brand/10 border border-brand/20 px-2 py-0.5 text-xs text-brand"
+					>
+						{name} (new)
+						<button
+							type="button"
+							className="rounded hover:bg-brand/20 p-0.5"
+							onClick={() => handleRemoveNewTagName(name)}
+						>
+							<svg className="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+								<path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+							</svg>
+						</button>
+					</span>
+				))}
+				<input
+					type="text"
+					className="flex-1 bg-transparent px-1 py-0.5 text-xs focus:outline-none min-w-[60px]"
+					placeholder={selectedTagIds.length === 0 && newTagNames.length === 0 ? "Add tag..." : ""}
+					value={input}
+					onFocus={() => setIsFocused(true)}
+					onBlur={() => setTimeout(() => setIsFocused(false), 200)}
+					onKeyDown={handleKeyDown}
+					onChange={(e) => setInput(e.target.value)}
+				/>
+			</div>
+
+			{isFocused && (input.trim() !== "" || suggestions.length > 0) && (
+				<div
+					className="absolute z-50 mt-1 max-h-40 w-full overflow-auto rounded-md border border-border shadow-md animate-fade-in p-1 text-xs top-full"
+					style={{ backgroundColor: "var(--color-card)", color: "var(--color-card-foreground)" }}
+				>
+					{suggestions.map((s) => (
+						<button
+							key={s.id}
+							type="button"
+							className="w-full text-left rounded px-2 py-1.5 hover:bg-secondary hover:text-secondary-foreground"
+							onClick={() => handleAddTagId(s.id)}
+						>
+							{s.name}
+						</button>
+					))}
+					{showCreateOption && (
+						<button
+							type="button"
+							className="w-full text-left rounded px-2 py-1.5 font-medium text-brand hover:bg-secondary hover:text-secondary-foreground"
+							onClick={() => handleAddNewTagName(input.trim())}
+						>
+							+ Add brand new tag: "{input.trim()}"
+						</button>
+					)}
+					{suggestions.length === 0 && !showCreateOption && (
+						<div className="px-2 py-1.5 text-muted-foreground text-center">No matches</div>
+					)}
+				</div>
+			)}
+		</div>
+	);
+}
+
+function TypeSelector({
+	existingTypes,
+	selectedTypeId,
+	newTypeName,
+	onChange,
+}: {
+	existingTypes: Thought[];
+	selectedTypeId: string | null;
+	newTypeName: string;
+	onChange: (id: string | null, newName: string) => void;
+}) {
+	const [input, setInput] = useState("");
+	const [isFocused, setIsFocused] = useState(false);
+
+	const selectedType = selectedTypeId && selectedTypeId !== "new"
+		? existingTypes.find((t) => t.id === selectedTypeId)
+		: null;
+
+	const suggestions = existingTypes
+		.filter(
+			(t) =>
+				(!input.trim() || t.name.toLowerCase().includes(input.toLowerCase().trim())),
+		)
+		.sort((a, b) => a.name.localeCompare(b.name));
+
+	const showCreateOption =
+		input.trim() &&
+		!existingTypes.some((t) => t.name.toLowerCase() === input.trim().toLowerCase()) &&
+		newTypeName.toLowerCase() !== input.trim().toLowerCase();
+
+	const handleSelectTypeId = (id: string) => {
+		onChange(id, "");
+		setInput("");
+	};
+
+	const handleAddNewTypeName = (name: string) => {
+		onChange("new", name);
+		setInput("");
+	};
+
+	const handleClear = () => {
+		onChange(null, "");
+		setInput("");
+	};
+
+	const handleKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
+		if (e.key === "Enter" && input.trim()) {
+			e.preventDefault();
+			const exactMatch = suggestions.find(
+				(t) => t.name.toLowerCase() === input.trim().toLowerCase(),
+			);
+			if (exactMatch) {
+				handleSelectTypeId(exactMatch.id);
+			} else if (showCreateOption) {
+				handleAddNewTypeName(input.trim());
+			} else if (suggestions.length > 0) {
+				handleSelectTypeId(suggestions[0].id);
+			}
+		}
+	};
+
+	return (
+		<div className="relative flex flex-col gap-1.5">
+			<span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">Thought Type</span>
+			<div className="flex items-center gap-1 rounded-md border border-input bg-background p-1.5 min-h-[36px] focus-within:border-brand focus-within:ring-1 focus-within:ring-brand shadow-sm">
+				{selectedType && (
+					<span className="inline-flex items-center gap-1 rounded bg-secondary px-2 py-0.5 text-xs text-secondary-foreground">
+						{selectedType.name}
+						<button
+							type="button"
+							className="rounded hover:bg-muted p-0.5"
+							onClick={handleClear}
+						>
+							<svg className="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+								<path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+							</svg>
+						</button>
+					</span>
+				)}
+				{selectedTypeId === "new" && newTypeName && (
+					<span className="inline-flex items-center gap-1 rounded bg-brand/10 border border-brand/20 px-2 py-0.5 text-xs text-brand">
+						{newTypeName} (new)
+						<button
+							type="button"
+							className="rounded hover:bg-brand/20 p-0.5"
+							onClick={handleClear}
+						>
+							<svg className="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+								<path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+							</svg>
+						</button>
+					</span>
+				)}
+				{!selectedTypeId && (
+					<input
+						type="text"
+						className="flex-1 bg-transparent px-1 py-0.5 text-xs focus:outline-none min-w-[60px]"
+						placeholder="Search or create type..."
+						value={input}
+						onFocus={() => setIsFocused(true)}
+						onBlur={() => setTimeout(() => setIsFocused(false), 200)}
+						onKeyDown={handleKeyDown}
+						onChange={(e) => setInput(e.target.value)}
+					/>
+				)}
+			</div>
+
+			{isFocused && !selectedTypeId && (input.trim() !== "" || suggestions.length > 0) && (
+				<div
+					className="absolute z-50 mt-1 max-h-40 w-full overflow-auto rounded-md border border-border shadow-md p-1 text-xs top-full"
+					style={{ backgroundColor: "var(--color-card)", color: "var(--color-card-foreground)" }}
+				>
+					{suggestions.map((s) => (
+						<button
+							key={s.id}
+							type="button"
+							className="w-full text-left rounded px-2 py-1.5 hover:bg-secondary hover:text-secondary-foreground"
+							onClick={() => handleSelectTypeId(s.id)}
+						>
+							{s.name}
+						</button>
+					))}
+					{showCreateOption && (
+						<button
+							type="button"
+							className="w-full text-left rounded px-2 py-1.5 font-medium text-brand hover:bg-secondary hover:text-secondary-foreground"
+							onClick={() => handleAddNewTypeName(input.trim())}
+						>
+							+ Add brand new type: "{input.trim()}"
+						</button>
+					)}
+					{suggestions.length === 0 && !showCreateOption && (
+						<div className="px-2 py-1.5 text-muted-foreground text-center">No matches</div>
+					)}
+				</div>
+			)}
+		</div>
+	);
+}
+
 function ReadyCard({
 	tab,
 	activeThought,
@@ -403,6 +866,22 @@ function ReadyCard({
 	onTrimChange,
 	onSend,
 	autoProceedActive,
+	brains,
+	selectedBrainId,
+	onBrainChange,
+	types,
+	tags,
+	selectedTypeId,
+	onTypeChange,
+	newTypeName,
+	selectedTagIds,
+	onSelectedTagIdsChange,
+	newTagNames,
+	onNewTagNamesChange,
+	isLoadingMetadata,
+	thoughtTargets,
+	selectedTargetIndex,
+	onTargetChange,
 }: {
 	tab: ActiveTab;
 	activeThought: ActiveThought;
@@ -413,10 +892,23 @@ function ReadyCard({
 	onTrimChange: (value: boolean) => void;
 	onSend: () => void;
 	autoProceedActive: boolean;
+	brains: Brain[];
+	selectedBrainId: string;
+	onBrainChange: (id: string) => void;
+	types: Thought[];
+	tags: Thought[];
+	selectedTypeId: string | null;
+	onTypeChange: (id: string | null, newName: string) => void;
+	newTypeName: string;
+	selectedTagIds: string[];
+	onSelectedTagIdsChange: (ids: string[]) => void;
+	newTagNames: string[];
+	onNewTagNamesChange: (names: string[]) => void;
+	isLoadingMetadata: boolean;
+	thoughtTargets: ThoughtTarget[];
+	selectedTargetIndex: number;
+	onTargetChange: (thoughtTargetIndex: number) => void;
 }) {
-	// Two-pass render so the bar animates: start at 100%, then flip to 0%
-	// on the next frame and let the CSS transition run. Remount (via key)
-	// when the countdown arms so it always starts full.
 	const [barWidth, setBarWidth] = useState("100%");
 	useEffect(() => {
 		if(!autoProceedActive) {
@@ -430,30 +922,89 @@ function ReadyCard({
 	const isException = isTrimException(tab.url, trimExceptions);
 	const showTrimOption = hasQueryOrHash(tab.url) && !isException;
 	const previewUrl = showTrimOption && trimQueryParams ? stripQueryAndHash(tab.url) : tab.url;
+	const selectedTarget =
+		thoughtTargets[clampThoughtTargetIndex(selectedTargetIndex, thoughtTargets)] ?? {
+			id: activeThought.id,
+			name: activeThought.name,
+			source: "active" as const,
+		};
 	const sendLabel =
 		mode === "createChild"
-			? `Create child of "${activeThought.name}"`
-			: `Attach to "${activeThought.name}"`;
+			? `Create child of "${selectedTarget.name}"`
+			: `Attach to "${selectedTarget.name}"`;
+
 	return (
 		<Card>
 			<CardHeader>
 				<CardTitle className="text-base">{stripUnreadCountPrefix(tab.title) || tab.url}</CardTitle>
 				<p className="break-all text-xs text-muted-foreground">{previewUrl}</p>
 			</CardHeader>
-			<CardContent className="flex flex-col gap-3 pt-0">
-				<div className="text-xs text-muted-foreground">
-					Active thought:{" "}
-					<span className="font-medium text-foreground">{activeThought.name}</span>
-					{activeThought.brainName && (
-						<span className="text-muted-foreground"> · {activeThought.brainName}</span>
-					)}
+			<CardContent className="flex flex-col gap-3.5 pt-0">
+				<div className="flex flex-col gap-1.5">
+					<span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">Target Brain</span>
+					<select
+						className="w-full rounded-md border border-input bg-background px-2.5 py-1.5 text-xs text-foreground shadow-sm transition-colors focus:border-brand focus:outline-none focus:ring-1 focus:ring-brand"
+						value={selectedBrainId}
+						onChange={(e) => onBrainChange(e.target.value)}
+					>
+						{brains.map((b) => (
+							<option key={b.id} value={b.id}>
+								{b.name}
+							</option>
+						))}
+					</select>
 				</div>
+
+				<div className="flex flex-col gap-1.5">
+					<span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">Relate to (Parent)</span>
+					<select
+						className="w-full rounded-md border border-input bg-background px-2.5 py-1.5 text-xs text-foreground shadow-sm transition-colors focus:border-brand focus:outline-none focus:ring-1 focus:ring-brand"
+						value={selectedTargetIndex}
+						onChange={(e) => onTargetChange(Number(e.target.value))}
+					>
+						{thoughtTargets.map((target, index) => (
+							<option key={`${target.source}:${target.id}`} value={index}>
+								{target.source === "active"
+									? `Active: "${target.name}"`
+									: `Pin: "${target.name}"`}
+							</option>
+						))}
+					</select>
+				</div>
+
 				<ModeToggle mode={mode} onChange={onModeChange} />
+
+				{isLoadingMetadata ? (
+					<div className="flex items-center justify-center gap-2 py-6 text-xs text-muted-foreground animate-pulse">
+						<Spinner />
+						<span>Loading brain data...</span>
+					</div>
+				) : (
+					mode === "createChild" && (
+						<div className="flex flex-col gap-3.5 border-t border-border/40 pt-3.5 animate-fade-in">
+							<TypeSelector
+								existingTypes={types}
+								selectedTypeId={selectedTypeId}
+								newTypeName={newTypeName}
+								onChange={onTypeChange}
+							/>
+
+							<TagsSelector
+								existingTags={tags}
+								selectedTagIds={selectedTagIds}
+								onSelectedTagIdsChange={onSelectedTagIdsChange}
+								newTagNames={newTagNames}
+								onNewTagNamesChange={onNewTagNamesChange}
+							/>
+						</div>
+					)
+				)}
+
 				{showTrimOption && (
-					<label className="flex items-center gap-2 text-xs text-muted-foreground">
+					<label className="flex items-center gap-2 text-xs text-muted-foreground cursor-pointer hover:text-foreground transition-colors py-1">
 						<input
 							type="checkbox"
-							className="h-3.5 w-3.5 accent-brand"
+							className="h-4 w-4 rounded border-input text-brand accent-brand cursor-pointer focus:ring-0 focus:ring-offset-0"
 							checked={trimQueryParams}
 							onChange={(e) => onTrimChange(e.target.checked)}
 						/>
@@ -462,7 +1013,7 @@ function ReadyCard({
 				)}
 			</CardContent>
 			<CardFooter className="flex-col items-stretch gap-2">
-				<Button onClick={onSend} className="w-full min-w-0" title={sendLabel}>
+				<Button onClick={onSend} className="w-full min-w-0 font-medium py-2 bg-brand text-brand-foreground hover:bg-brand/90 transition-all rounded shadow-md hover:shadow-lg" title={sendLabel} disabled={isLoadingMetadata}>
 					<span className="min-w-0 truncate">{sendLabel}</span>
 				</Button>
 				{autoProceedActive && (
