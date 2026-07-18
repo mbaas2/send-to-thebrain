@@ -41,6 +41,11 @@ export interface Thought {
 	forgottenDateTime: string | null;
 }
 
+export interface ThoughtReference {
+	id: string;
+	name: string;
+}
+
 export interface Attachment {
 	id: string;
 	brainId: string;
@@ -89,8 +94,8 @@ export enum AcType {
 export interface CreateThoughtRequest {
 	name: string;
 	label?: string | null;
-	sourceThoughtId: string;
-	relation: LinkRelation;
+	sourceThoughtId?: string | null;
+	relation?: LinkRelation | null;
 	kind: ThoughtKind;
 	typeId?: string | null;
 	acType: AcType;
